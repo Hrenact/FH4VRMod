@@ -54,7 +54,7 @@ function Write-NewUtf8File {
 
 try {
     $workspace = (Resolve-Path -LiteralPath (Split-Path $PSScriptRoot -Parent)).ProviderPath
-    $gitPath = (Get-Command git -CommandType Application -ErrorAction Stop).Source
+    $gitPath = (Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
     $gitRoot = Invoke-GitChecked $workspace @('rev-parse', '--show-toplevel')
     if (-not [string]::Equals([IO.Path]::GetFullPath($gitRoot).TrimEnd('\', '/'),
             $workspace.TrimEnd('\', '/'), [StringComparison]::OrdinalIgnoreCase)) {
