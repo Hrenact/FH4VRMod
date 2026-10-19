@@ -310,6 +310,9 @@ static void Log(DWORD status) {
 #ifdef FH4VR_UI_MAP_PROBE
 #include "ui_map_probe.h"
 #endif
+#ifdef FH4VR_UI_MAP_CLIP
+#include "ui_map_mode_probe.h"
+#endif
 #include "menu_camera_probe.h"
 #include "presentation_camera_probe.h"
 #include "multicam_probe.h"
@@ -453,6 +456,12 @@ extern "C" DWORD WINAPI StartProbe(void*) {
         const DWORD mapStatus=ui_map_probe::Start(base,self,ReplaceSlot,
             [](){return stereo_trial::Offset(true,GetTickCount64())!=0;});
         ui_projection_probe::Record("map_probe_enabled",mapStatus,nullptr,nullptr);
+#ifdef FH4VR_UI_MAP_CLIP
+        if(mapStatus==ERROR_SUCCESS) {
+            const DWORD modeStatus=ui_map_mode_probe::Start(base,self,ReplaceSlot);
+            ui_projection_probe::Record("map_clip_enabled",modeStatus,nullptr,nullptr);
+        }
+#endif
     }
 #endif
     if(status==ERROR_SUCCESS)Log(multicam_probe::Start(base,self,ReplaceSlot));
@@ -462,6 +471,9 @@ extern "C" DWORD WINAPI StartProbe(void*) {
 
 extern "C" DWORD WINAPI StopProbe(void*) {
 #ifdef FH4VR_UI_PROJECTION_PROBE
+#ifdef FH4VR_UI_MAP_CLIP
+    ui_map_mode_probe::Stop(ReplaceSlot);
+#endif
 #ifdef FH4VR_UI_MAP_PROBE
     ui_map_probe::Stop(ReplaceSlot);
 #endif

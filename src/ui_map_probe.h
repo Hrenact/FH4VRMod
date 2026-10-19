@@ -29,6 +29,30 @@ inline std::atomic<uint64_t> calls{0},returns{0},unwinds{0},activeCalls{0},insid
 // Independent budgets ensure an unrelated/native call cannot consume the first
 // observations of the root-scoped, active-VR path. Bit 0 = root, bit 1 = VR.
 inline std::atomic<uint64_t> eligibleCalls[4]{},lastLogTick[4]{};
+// This stack describes only the synchronous native slot31 invocation. It does
+// not cache MapRenderer identities: those can change while slot31 prepares a view.
+struct MapFrame {
+    MapFrame* parent=nullptr;ui_root_probe::Frame* root=nullptr;
+    uint64_t id=0,rootId=0;unsigned depth=0;
+    void* node=nullptr;void* context=nullptr;void* expectedRenderer=nullptr;
+};
+inline thread_local MapFrame* currentMap=nullptr;
+inline std::atomic<uint64_t> mapScopes{0},mapTlsMismatches{0};
+struct MapScope {
+    MapFrame frame{};
+    MapScope(void* node,void* context) {
+        frame.parent=currentMap;frame.root=ui_root_probe::current;
+        frame.id=mapScopes.fetch_add(1,std::memory_order_relaxed)+1;
+        frame.depth=frame.parent?frame.parent->depth+1:1;frame.node=node;frame.context=context;
+        if(frame.root){frame.rootId=frame.root->id;frame.expectedRenderer=frame.root->expectedRenderer;}
+        currentMap=&frame;
+    }
+    MapScope(const MapScope&)=delete;MapScope& operator=(const MapScope&)=delete;
+    ~MapScope() noexcept {
+        LastErrorGuard error;if(currentMap!=&frame)++mapTlsMismatches;
+        currentMap=frame.parent;
+    }
+};
 struct Activity {bool known=false,active=false;};
 inline Activity CurrentActivity() {
     LastErrorGuard error;Activity a;
@@ -164,6 +188,7 @@ public:
 };
 __declspec(noinline) inline void Observe(void* node,void* drawContext) {
     DWORD incoming=GetLastError();Invocation invocation(node,drawContext,_ReturnAddress());
+    MapScope mapScope(node,drawContext);
     auto function=original.load(std::memory_order_acquire);SetLastError(incoming);
     function(node,drawContext); // Exact ABI, exactly one call, propagate native exception.
     DWORD outgoing=GetLastError();invocation.returned=true;SetLastError(outgoing);

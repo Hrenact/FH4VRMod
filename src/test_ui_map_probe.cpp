@@ -13,11 +13,15 @@ static bool Active(){SetLastError(0x9999);return true;}
 static bool ThrowActivity(){SetLastError(0xabcd);throw std::runtime_error("diagnostic query");}
 static void Mock(void* node,void* context){
     assert(node==expectedNode && context==expectedContext && GetLastError()==Incoming);++mockCalls;
-    if(nesting){nesting=false;SetLastError(Incoming);p::Observe(node,context);assert(GetLastError()==Outgoing);}
+    assert(p::currentMap && p::currentMap->node==node && p::currentMap->context==context);
+    assert(p::currentMap->root==ui_root_probe::current);
+    if(ui_root_probe::current)assert(p::currentMap->rootId==ui_root_probe::current->id && p::currentMap->expectedRenderer==ui_root_probe::current->expectedRenderer);
+    auto current=p::currentMap;
+    if(nesting){nesting=false;SetLastError(Incoming);p::Observe(node,context);assert(GetLastError()==Outgoing && p::currentMap==current);}
     SetLastError(Outgoing);
 }
 static void Throw(void* node,void* context){assert(node==expectedNode && context==expectedContext && GetLastError()==Incoming);SetLastError(0xdead);throw std::runtime_error("native");}
-static void Call(void* node,void* context){expectedNode=node;expectedContext=context;SetLastError(Incoming);p::Observe(node,context);assert(GetLastError()==Outgoing);}
+static void Call(void* node,void* context){auto prior=p::currentMap;expectedNode=node;expectedContext=context;SetLastError(Incoming);p::Observe(node,context);assert(GetLastError()==Outgoing && p::currentMap==prior);}
 template<class T> static void Put(unsigned char* memory,size_t offset,const T& value){memcpy(memory+offset,&value,sizeof(value));}
 struct ImageFixture {
     unsigned char* memory=nullptr;uintptr_t base=0;
@@ -42,14 +46,14 @@ static void TestForwarding(){
     p::original.store(&Throw);expectedNode=node;expectedContext=context;auto returned=p::returns.load(),unwound=p::unwinds.load();
     SetLastError(Incoming);bool caught=false;try{p::Observe(node,context);}catch(const std::runtime_error&){caught=true;assert(GetLastError()==0xdead);}
     assert(caught && p::returns.load()==returned && p::unwinds.load()==unwound+1 && !p::activeCalls.load());
-    assert(ui_root_probe::current==&frame);ui_root_probe::current=nullptr;p::original.store(&Mock);
+    assert(ui_root_probe::current==&frame && !p::currentMap);ui_root_probe::current=nullptr;p::original.store(&Mock);
     before=mockCalls.load();ui_root_probe::activeRoots.store(1);std::thread threads[4];
     for(unsigned t=0;t<4;++t)threads[t]=std::thread([t](){unsigned char ownNode[0x200]{},ownContext[256]{};
         memset(ownNode,static_cast<int>(t+1),sizeof(ownNode));memset(ownContext,static_cast<int>(t+7),sizeof(ownContext));
         for(unsigned n=0;n<10000;++n)Call(ownNode,ownContext);
         for(auto byte:ownNode)assert(byte==t+1);for(auto byte:ownContext)assert(byte==t+7);assert(!ui_root_probe::current);});
     for(auto& thread:threads)thread.join();ui_root_probe::activeRoots.store(0);
-    assert(mockCalls.load()==before+40000 && !p::activeCalls.load() && p::outsideActive.load()==40000);
+    assert(mockCalls.load()==before+40000 && !p::activeCalls.load() && p::outsideActive.load()==40000 && !p::mapTlsMismatches.load());
     puts("PASS: ABI arguments/context untouched, exactly once, nested TLS, native exception, LastError, 40,000 independent concurrent calls");
 }
 static void TestCapture(ImageFixture& image){
