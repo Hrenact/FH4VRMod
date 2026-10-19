@@ -1,0 +1,6 @@
+[VR]
+; Linear scale against the current SteamVR per-eye recommendation (0.25 to 2.0).
+; 0.75 means 75% width and height, not 75% total pixels.
+; Currently reports a target only; it does NOT resize the game or upscale textures.
+; Copy as fh4vr.ini beside the game's dxgi.dll. Omission defaults to 1.0.
+RenderScale=1.0

@@ -1,0 +1,11 @@
+reports/
+build/
+__pycache__/
+.deps/
+.tools/
+*.log
+*.pdb
+*.obj
+*.ilk
+fh4vr.ini
+fh4vr-capture-*.png
