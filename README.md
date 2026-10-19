@@ -2,7 +2,7 @@
 
 为 **Steam 版《极限竞速：地平线 4》**开发的实验性 3DoF VR 模组，通过 SteamVR / OpenVR 输出双眼画面。
 
-已发布恢复版本：**v0.1.0-preview.1 — 可恢复测试基线**。当前分支另含已通过实机验证的地图裁切修正，尚未打包为新 Release；原恢复包保持不变。
+当前版本：**v0.1.0-preview.2 — 地图裁切修正版**。上一版 `v0.1.0-preview.1` 继续保留为独立恢复点。
 
 ## 已验证的功能
 
@@ -11,7 +11,7 @@
 - F2 持续开关 VR，无 60 秒限时。
 - F6 只校准左右朝向；正常抬头、低头和歪头跟踪仍保留。
 - UI 固定在开启或回正时的前方，文字及玩家头像列表的已知裁切问题已改善。
-- 当前分支在 VR 中自动修正暂停菜单地图裁切，无需 F11；完整地图缩放、平移、F2 重复开关及驾驶小地图检查均已通过。
+- VR 中自动修正暂停菜单地图裁切，无需 F11；完整地图缩放、平移、F2 重复开关及驾驶小地图检查均已通过。
 - 从当前 SteamVR 读取推荐尺寸和双眼投影；不固定为某款头显或某个分辨率。
 
 验证环境为 RTX 4070、PICO 4 Pro、PICO Connect 无线串流与 SteamVR。其他设备尚未验证。
@@ -91,7 +91,7 @@ RenderScale=1.0
 ```powershell
 git clone --recurse-submodules https://github.com/Hrenact/FH4VRMod.git
 cd FH4VRMod
-git switch --detach v0.1.0-preview.1
+git switch --detach v0.1.0-preview.2
 git submodule update --init --recursive
 cmd /c build-stereo-trial.cmd
 cmd /c build-runtime-mode.cmd
