@@ -7,6 +7,10 @@
 #include "ui_projection_test.h"
 #include "runtime_projection.h"
 #include "stereo_trial.h"
+#include "frame_order_trace.h"
+#ifdef FH4VR_RENDER_CYCLE_LATCH
+#include "render_cycle_state.h"
+#endif
 #include "ui_clip_projection.h"
 #include "ui_affine_clip.h"
 #include "ui_pass_probe.h"
@@ -142,6 +146,9 @@ inline void Record(const char* event,unsigned long long count,const float* m,voi
 }
 inline void Observe(void* object,const float* matrix) {
     void* caller=_ReturnAddress();
+#ifdef FH4VR_FRAME_ORDER_TRACE
+    frame_order_trace::Record(frame_order_trace::UiEnter,stereo_trial::command.load(),caller,object);
+#endif
     unsigned long long count=++calls;
     DWORD incomingError=GetLastError();DWORD foregroundPid=0;
     GetWindowThreadProcessId(GetForegroundWindow(),&foregroundPid);
@@ -152,9 +159,23 @@ inline void Observe(void* object,const float* matrix) {
         (GetAsyncKeyState(VK_F11)&0x8000)!=0,GetTickCount64())!=0;
 #endif
     uint64_t size=ui_projection_test::dimensions.load();float copy[16];
+#ifdef FH4VR_RENDER_CYCLE_LATCH
+    const auto cycle=render_cycle::state.Read();
+    const float eye=stereo_trial::RenderAllowed(foregroundPid==GetCurrentProcessId()) && stereo_trial::command.load()?render_cycle::Eye(cycle,stereo_trial::holdFrames):0;
+    const auto uiDirection=cycle.ui;
+    frame_order_trace::Record(frame_order_trace::UiSnapshot,cycle.command,caller,object);
+#else
     const float eye=stereo_trial::Offset(foregroundPid==GetCurrentProcessId(),GetTickCount64());
+    const auto uiDirection=ui_smoothing::Read();
+#endif
     const bool plane=eye!=0 && ui_projection_test::Plane(matrix,copy,
-        static_cast<uint32_t>(size>>32),static_cast<uint32_t>(size),runtime_projection::verticalRadians.load(),eye,ui_smoothing::Read());
+        static_cast<uint32_t>(size>>32),static_cast<uint32_t>(size),runtime_projection::verticalRadians.load(),eye,uiDirection);
+#if defined(FH4VR_FRAME_ORDER_TRACE) && defined(FH4VR_RENDER_CYCLE_LATCH)
+    if(frame_order_trace::recorder.Active())frame_order_trace::Record(
+        plane?frame_order_trace::UiPlane:frame_order_trace::UiPassthrough,
+        cycle.command,caller,object,frame_order_trace::MatrixFingerprint(matrix),
+        frame_order_trace::MatrixFingerprint(plane?copy:matrix));
+#endif
     trialObject=nullptr;
 #ifdef FH4VR_UI_PROJECTIVE_CLIP_TRIAL
     if(ClipTrialActive(foregroundPid==GetCurrentProcessId(),
@@ -163,6 +184,9 @@ inline void Observe(void* object,const float* matrix) {
     bool changed=plane || (eye==0 && active && ui_projection_test::Shrink(matrix,copy,static_cast<uint32_t>(size>>32),static_cast<uint32_t>(size)));
     SetLastError(incomingError);
     original(object,changed?copy:matrix);DWORD saved=GetLastError();
+#ifdef FH4VR_FRAME_ORDER_TRACE
+    frame_order_trace::Record(frame_order_trace::UiExit,stereo_trial::command.load(),caller,object);
+#endif
 #ifdef FH4VR_UI_ROOT_PROBE
     ui_root_probe::ObserveEvent("setter",object,caller,changed);
 #endif

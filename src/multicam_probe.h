@@ -1,6 +1,13 @@
 #pragma once
 #include "menu_camera_probe.h"
 #include "eye_offset.h"
+#include "frame_order_trace.h"
+#ifdef FH4VR_RENDER_CYCLE_LATCH
+#include "render_cycle_state.h"
+#endif
+#ifdef FH4VR_FRAME_PHASE
+#include "frame_phase_state.h"
+#endif
 #ifdef FH4VR_MULTICAM_VR
 #include "stereo_head.h"
 #include "runtime_projection.h"
@@ -13,6 +20,7 @@ using Getter=void*(*)(void*,void*);
 inline Getter original[2]{};
 inline void* volatile* slots[2]{};
 inline HMODULE owner=nullptr;
+inline uintptr_t gameBase=0;
 inline std::atomic<uint64_t> calls[2]{},lastTicks[2]{};
 inline constexpr unsigned slotIndex[]={12,52};
 inline constexpr uintptr_t rvas[]={0x3150680,0x3150960};
@@ -46,19 +54,67 @@ inline bool Shift(unsigned index,void* output,const float* view,float eye){
     if(!ApplyEyePosition(position,view,eye))return false;
     memcpy(output,position,3*sizeof(double));return true;
 }
+#ifdef FH4VR_RENDER_CYCLE_LATCH
+inline bool ApplyCycleHead(float* view,const HeadPose& pose){
+    if(!PoseUsable(pose,GetTickCount64()))return true;
+    const bool ok=ApplyHeadRotation(view,pose.rotation);
+    if(ok)++stereo_head::applied;else ++stereo_head::rejected;
+    return ok;
+}
+#endif
 template<unsigned I> void* Observe(void* object,void* output){
+#if defined(FH4VR_FRAME_ORDER_TRACE) || defined(FH4VR_RENDER_CYCLE_LATCH)
+    const void* caller=_ReturnAddress();
+#endif
+#ifdef FH4VR_RENDER_CYCLE_LATCH
+    if constexpr(I==0){
+        if(reinterpret_cast<uintptr_t>(caller)==gameBase+0x30c762d && stereo_trial::command.load()){
+            const auto cycle=render_cycle::state.Latch();
+            frame_order_trace::Record(frame_order_trace::CycleLatch,cycle.command,caller,object);
+        }
+    }
+#endif
+#ifdef FH4VR_FRAME_ORDER_TRACE
+    frame_order_trace::Record(I==0?frame_order_trace::MatrixEnter:frame_order_trace::PositionEnter,stereo_trial::command.load(),caller,object);
+#endif
     void* result=original[I](object,output);const DWORD saved=GetLastError();const auto count=++calls[I];
     float eye=0;bool applied=false;unsigned failure=0;bool forceLog=false;
-#ifdef FH4VR_MULTICAM_VR
+#if defined(FH4VR_FRAME_PHASE)
     DWORD foreground=0;GetWindowThreadProcessId(GetForegroundWindow(),&foreground);
+    const unsigned phase=frame_phase::state.Read(foreground==GetCurrentProcessId(),GetTickCount64());
+    eye=frame_phase::Eye(phase);
+    if(phase){
+        ++frame_phase::state.calls[phase][I];
+        if(result && result==output){
+            alignas(16) float view[16]{};
+            if(eye==0)applied=true;
+            else if constexpr(I==0)applied=Shift(I,output,nullptr,eye);
+            else if(menu_camera_probe::Read(static_cast<char*>(object)+0x330,view,sizeof(view)))applied=Shift(I,output,view,eye);
+        }
+        if(applied)++frame_phase::state.applied[phase][I];else ++frame_phase::state.rejected[phase][I];
+    }
+#elif defined(FH4VR_MULTICAM_VR)
+    DWORD foreground=0;GetWindowThreadProcessId(GetForegroundWindow(),&foreground);
+#ifdef FH4VR_RENDER_CYCLE_LATCH
+    const auto cycle=render_cycle::state.Read();
+    eye=stereo_trial::RenderAllowed(foreground==GetCurrentProcessId()) && stereo_trial::command.load()?render_cycle::Eye(cycle,stereo_trial::holdFrames):0;
+    frame_order_trace::Record(frame_order_trace::CameraSnapshot,cycle.command,caller,object);
+#else
     eye=stereo_trial::Offset(foreground==GetCurrentProcessId(),GetTickCount64());
+#endif
     if(eye!=0 && result && result==output){
         alignas(16) float view[16]{};
         bool valid=false;
         if constexpr(I==0){memcpy(view,output,sizeof(view));valid=true;}
         else valid=menu_camera_probe::Read(static_cast<char*>(object)+0x330,view,sizeof(view));
         if(!valid)failure=1;
-        else if(!stereo_head::Apply(view))failure=2;
+        else if(
+#ifdef FH4VR_RENDER_CYCLE_LATCH
+            !ApplyCycleHead(view,cycle.pose)
+#else
+            !stereo_head::Apply(view)
+#endif
+        )failure=2;
         else {
             if constexpr(I==0){applied=Shift(I,view,nullptr,eye);if(applied)memcpy(output,view,sizeof(view));}
             else applied=Shift(I,output,view,eye);
@@ -95,17 +151,25 @@ template<unsigned I> void* Observe(void* object,void* output){
             }
         }
     }
+#ifdef FH4VR_FRAME_ORDER_TRACE
+    frame_order_trace::Record(I==0?frame_order_trace::MatrixExit:frame_order_trace::PositionExit,stereo_trial::command.load(),caller,object);
+#endif
     SetLastError(saved);return result;
 }
 inline void* observer(unsigned i){return i==0?reinterpret_cast<void*>(&Observe<0>):reinterpret_cast<void*>(&Observe<1>);}
 template<class Replace> DWORD Start(uintptr_t base,HMODULE module,Replace replace){
+#ifdef FH4VR_RENDER_CYCLE_LATCH
+    unsigned char boundaryCall[3]{};
+    if(!menu_camera_probe::Read(reinterpret_cast<void*>(base+0x30c762a),boundaryCall,3) ||
+       memcmp(boundaryCall,"\xff\x50\x60",3))return ERROR_REVISION_MISMATCH;
+#endif
     const unsigned char expected[2][7]={{0x0f,0x28,0x81,0x30,0x03,0x00,0x00},{0x48,0x8b,0x81,0x78,0x03,0x00,0x00}};
     for(unsigned i=0;i<2;++i){
         unsigned char code[7]{};void* pointer=nullptr;auto target=reinterpret_cast<void*>(base+rvas[i]);
         auto s=reinterpret_cast<void* volatile*>(base+0x5306aa0+slotIndex[i]*8);
         if(!menu_camera_probe::Read(target,code,7)||memcmp(code,expected[i],7)||!menu_camera_probe::Read(const_cast<void**>(s),&pointer,8)||pointer!=target)return ERROR_REVISION_MISMATCH;
     }
-    owner=module;
+    owner=module;gameBase=base;
 #ifdef FH4VR_MULTICAM_VR
     constexpr uintptr_t scalarRvas[]={0x3150390,0x3150750};constexpr unsigned scalarIndices[]={19,49};
     const unsigned char scalarCode[2][8]={{0xf3,0x0f,0x10,0x81,0x70,0x03,0,0},{0x48,0x8b,0x89,0xd8,0x02,0,0,0x48}};

@@ -46,14 +46,18 @@ def run(args):
             matches = args.address
             complete = True
         else:
-            address = 0
+            address = args.start
             while time.monotonic() - started < args.seconds and total < args.max_gib * 1024**3:
+                if address >= args.end:
+                    complete = True
+                    break
                 region = Region()
                 if not k.VirtualQueryEx(handle, address, c.byref(region), c.sizeof(region)):
                     complete = True
                     break
-                start = region.BaseAddress or 0
-                end = start + region.RegionSize
+                region_start = region.BaseAddress or 0
+                start = max(address, region_start)
+                end = min(args.end, region_start + region.RegionSize)
                 if end <= address:
                     break
                 address = end
@@ -102,6 +106,8 @@ if __name__ == '__main__':
     p.add_argument('--address', type=lambda s: int(s,0), action='append')
     p.add_argument('--seconds', type=int, default=40)
     p.add_argument('--max-gib', type=int, default=8)
+    p.add_argument('--start', type=lambda s: int(s,0), default=0)
+    p.add_argument('--end', type=lambda s: int(s,0), default=0x7fffffffffff)
     p.add_argument('--out', type=Path, required=True)
     p.add_argument('--duration', type=float, default=0, help='Repeated snapshots of explicit addresses, in seconds')
     p.add_argument('--interval', type=float, default=0.1)

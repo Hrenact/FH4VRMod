@@ -1,5 +1,18 @@
 #pragma once
 #include "camera_pair_recovery.h"
+#include "capture_cycle_guard.h"
+#include "guard_timing_trace.h"
+#include "vr_timing_probe.h"
+#include "scene_submission_fence.h"
+#ifdef FH4VR_RENDER_MATRIX_PROBE
+#include "render_source_tracker.h"
+#endif
+#ifdef FH4VR_RENDER_CYCLE_LATCH
+#include "render_cycle_state.h"
+#endif
+#ifdef FH4VR_FRAME_PHASE
+#include "frame_phase_capture.h"
+#endif
 #include <new>
 #ifdef FH4VR_FRAME_CAPTURE
 #include "frame_capture.h"
@@ -18,6 +31,7 @@
 #endif
 #ifdef FH4VR_STEREO_TRIAL
 #include "gpu_copy.h"
+#include "stereo_copy.h"
 #include "live_overlay.h"
 #ifdef FH4VR_LIVE_SCENE
 #include "live_scene.h"
@@ -32,6 +46,74 @@ class SwapchainWrapper final : public IDXGISwapChain4 {
     std::atomic<ULONG> references{1};
     IDXGISwapChain4* real;
     std::atomic<unsigned long long> presents{0};
+#ifdef FH4VR_TIMING_PROBE
+    vr_timing::Window timingWindow;
+#endif
+#ifdef FH4VR_FRAME_PHASE
+    frame_phase::Batch phaseBatch;
+    bool phaseHeld=true,phaseActive=false,phasePending=false;
+    void StopPhase(const char* reason){
+        if(!phaseActive && !phasePending)return;
+        frame_phase::state.Stop();phaseActive=phasePending=false;
+        Log("frame_phase_stop reason=%s camera_command=0",reason);
+        for(unsigned phase=1;phase<=frame_phase::Count;++phase){
+            auto image=phaseBatch.Image(phase);if(!image)continue;
+            capture::Image pixels;bool retained=false;
+            HRESULT hr=capture::Readback(captureQueue.Get(),image,pixels,retained);
+            wchar_t path[MAX_PATH]{};GetModuleFileNameW(module,path,MAX_PATH);auto tail=wcsrchr(path,L'\\');
+            if(SUCCEEDED(hr) && tail){
+                swprintf_s(tail+1,MAX_PATH-(tail+1-path),L"fh4vr-phase-%lu-%02u.png",GetCurrentProcessId(),phase);
+                hr=capture::SavePng(path,pixels);
+            }else if(SUCCEEDED(hr))hr=E_FAIL;
+            Log("frame_phase_saved phase=%u hr=%08lx retained=%d matrix_calls=%llu position_calls=%llu matrix_applied=%llu position_applied=%llu matrix_rejected=%llu position_rejected=%llu path=%ls",
+                phase,hr,retained,frame_phase::state.calls[phase][0].load(),frame_phase::state.calls[phase][1].load(),
+                frame_phase::state.applied[phase][0].load(),frame_phase::state.applied[phase][1].load(),
+                frame_phase::state.rejected[phase][0].load(),frame_phase::state.rejected[phase][1].load(),path);
+            if(retained)break;
+        }
+        Log("frame_phase_drain hr=%08lx",phaseBatch.Drain());
+    }
+    unsigned CapturePhase(UINT flags){
+        if(flags&DXGI_PRESENT_TEST)return 0;
+        DWORD foreground=0;GetWindowThreadProcessId(GetForegroundWindow(),&foreground);
+        const bool pressed=(GetAsyncKeyState(VK_F3)&0x8000)!=0;
+        if(foreground!=GetCurrentProcessId()){phaseHeld=true;StopPhase("focus");return 0;}
+        const bool trigger=pressed && !phaseHeld;phaseHeld=pressed;
+        if(trigger && !phaseActive && !phasePending && captureQueue && frame_phase::state.Reserve()){
+            capture::ComPtr<ID3D12Resource> source;
+            HRESULT hr=real->GetBuffer(real->GetCurrentBackBufferIndex(),IID_PPV_ARGS(&source));
+            if(SUCCEEDED(hr))hr=phaseBatch.Prepare(captureQueue.Get(),source.Get());
+            if(FAILED(hr)){Log("frame_phase_prepare_error hr=%08lx",hr);return 0;}
+            phasePending=true;
+            Log("frame_phase_prepared count=%u crop=%u,%u,%u,%u phase1_after_present=1",frame_phase::Count,phaseBatch.x,phaseBatch.y,phaseBatch.width,phaseBatch.height);
+            return 0;
+        }
+        if(!phaseActive)return 0;
+        const unsigned phase=frame_phase::state.Read(true,GetTickCount64());
+        if(!phase){StopPhase("timeout");return 0;}
+        capture::ComPtr<ID3D12Resource> source;
+        HRESULT hr=real->GetBuffer(real->GetCurrentBackBufferIndex(),IID_PPV_ARGS(&source));
+        const auto begin=vr_timing::Now();
+        if(SUCCEEDED(hr))hr=phaseBatch.Copy(phase,source.Get());
+        Log("frame_phase_copy phase=%u nominal_eye=%f backbuffer=%u qpc_ms=%.6f cpu_ms=%.6f hr=%08lx matrix_calls=%llu position_calls=%llu",
+            phase,frame_phase::Eye(phase),real->GetCurrentBackBufferIndex(),begin,vr_timing::Now()-begin,hr,
+            frame_phase::state.calls[phase][0].load(),frame_phase::state.calls[phase][1].load());
+        if(hr!=S_OK){StopPhase("copy_error");return 0;}
+        return phase;
+    }
+    void AdvancePhase(unsigned phase,HRESULT hr){
+        if(!phaseActive && !phasePending)return;
+        if(hr!=S_OK){StopPhase("present_error");return;}
+        if(phasePending){
+            phasePending=false;phaseActive=frame_phase::state.Begin(GetTickCount64());
+            Log("frame_phase_begin active=%d qpc_ms=%.6f",phaseActive,vr_timing::Now());return;
+        }
+        if(phase){
+            Log("frame_phase_present phase=%u qpc_ms=%.6f matrix_calls=%llu position_calls=%llu",phase,vr_timing::Now(),frame_phase::state.calls[phase][0].load(),frame_phase::state.calls[phase][1].load());
+            if(!frame_phase::state.Advance(phase,GetTickCount64()))StopPhase("complete_or_timeout");
+        }
+    }
+#endif
 #ifdef FH4VR_FRAME_CAPTURE
     capture::ComPtr<ID3D12CommandQueue> captureQueue;
     bool captureHeld=true,captureDisabled=false;
@@ -205,19 +287,48 @@ class SwapchainWrapper final : public IDXGISwapChain4 {
     }
 #endif
 #ifdef FH4VR_STEREO_TRIAL
-    gpu_copy::Ring stereoRing{D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,1};
+    gpu_copy::StereoRing stereoRing;
 #ifdef FH4VR_LIVE_SCENE
     LiveScene stereoOverlay;
 #else
     LiveOverlay stereoOverlay;
 #endif
     stereo_trial::ToggleKey stereoKey;
-    bool stereoActive=false,stereoPairLeft=false;
+    bool stereoActive=false;
+#ifdef FH4VR_FRAME_ORDER_TRACE
+    bool frameTraceKeyHeld=true;
+#endif
     CameraPairRecovery cameraRecovery;
+    CaptureCycleGuard captureCycleGuard;
+#ifdef FH4VR_GUARD_TIMING_TRACE
+    std::unique_ptr<guard_timing::Recorder<>> guardTrace;
+#endif
     uint64_t stereoFrame=0,stereoEyes[2]{};
+#ifdef FH4VR_SOURCE_DRIVEN_STEREO
+    uint64_t lastSourceCommand=0,sourceUnknown=0,sourceRejected=0;
+#endif
+#ifdef FH4VR_SCENE_IMPLICIT_HANDOFF
+    SceneSubmissionFence sceneSubmissionFence;
+    HRESULT SealSceneSubmission(bool poseWaitSucceeded){
+        return sceneSubmissionFence.Finish(poseWaitSucceeded,[&]{stereoOverlay.Handoff();},[&]{
+            return vr_timing::Measure(vr_timing::Stage::Seal,[&]{return stereoRing.SealLatest();});
+        });
+    }
+#endif
     void StopStereo(const char* reason) {
         if(!stereoActive) return;
+#ifdef FH4VR_SCENE_IMPLICIT_HANDOFF
+        const HRESULT sealResult=SealSceneSubmission(false);
+        if(FAILED(sealResult))Log("scene_stop_seal_error hr=%08lx",sealResult);
+#endif
         stereoActive=false;stereo_trial::command.store(0);
+#ifdef FH4VR_SOURCE_DRIVEN_STEREO
+        render_source::tracker.Reset();
+        Log("source_capture_stop last=%llu unknown=%llu",lastSourceCommand,sourceUnknown);
+#endif
+#ifdef FH4VR_RENDER_CYCLE_LATCH
+        render_cycle::state.Stop();
+#endif
         stereoOverlay.Stop();
         // Capture only the normal timed stop, after the compositor releases its texture.
         // Keep readback and encoding outside the alternating-eye sequence.
@@ -234,20 +345,45 @@ class SwapchainWrapper final : public IDXGISwapChain4 {
             Log("stereo_alpha pixels=%llu zero=%llu opaque=%llu zero_top_half=%llu",
                 static_cast<UINT64>(proof.width)*proof.height,proof.alphaZero,proof.alphaOpaque,proof.alphaZeroTop);
         }
+#ifdef FH4VR_CAPTURE_CYCLE_GUARD
+        Log("capture_cycle_guard_stop anomalies=%llu dropped=%llu sequence_changes=%llu",captureCycleGuard.anomalies,captureCycleGuard.dropped,captureCycleGuard.sequenceChanges);
+#endif
         HRESULT hr=stereoRing.Drain();
 #ifdef FH4VR_STEREO_HEAD
         Log("stereo_head_stop applied=%llu rejected=%llu",stereo_head::applied.load(),stereo_head::rejected.load());
 #endif
         Log("stereo_stop reason=%s hr=%08lx frames=%llu left=%llu right=%llu submitted=%u skipped=%llu retained=%d applied=%llu rejected=%llu",
             reason,hr,stereoFrame,stereoEyes[0],stereoEyes[1],stereoOverlay.submitted,stereoRing.skipped,stereoRing.retained,stereo_trial::applied.load(),stereo_trial::rejected.load());
+#ifdef FH4VR_GUARD_TIMING_TRACE
+        if(guardTrace){
+            wchar_t guardPath[MAX_PATH]{};GetModuleFileNameW(module,guardPath,MAX_PATH);
+            if(auto tail=wcsrchr(guardPath,L'\\')){
+                swprintf_s(tail+1,MAX_PATH-(tail+1-guardPath),L"fh4vr-guard-timing-%lu-%llu.csv",GetCurrentProcessId(),GetTickCount64());
+                HRESULT saved=guardTrace->Save(guardPath);
+                Log("guard_trace_saved hr=%08lx events=%u dropped=%u path=%ls",saved,guardTrace->Count(),guardTrace->Dropped(),guardPath);
+            }
+            guardTrace.reset();
+        }
+#endif
+#ifdef FH4VR_FRAME_ORDER_TRACE
+        wchar_t tracePath[MAX_PATH]{};GetModuleFileNameW(module,tracePath,MAX_PATH);
+        if(auto tail=wcsrchr(tracePath,L'\\')){
+            swprintf_s(tail+1,MAX_PATH-(tail+1-tracePath),L"fh4vr-frame-order-%lu-%llu.csv",GetCurrentProcessId(),GetTickCount64());
+            HRESULT traceHr=frame_order_trace::recorder.Save(tracePath);
+            if(traceHr!=S_FALSE)Log("frame_order_saved hr=%08lx events=%u dropped=%u path=%ls",traceHr,frame_order_trace::recorder.Count(),frame_order_trace::recorder.Dropped(),tracePath);
+        }
+#endif
     }
     bool BeforeStereo(UINT flags) {
+#ifdef FH4VR_FRAME_PHASE
+        (void)flags;return false; // Monitor-only diagnostic: F2 cannot start VR.
+#else
         if(flags&DXGI_PRESENT_TEST) return false;
         DWORD foreground=0;GetWindowThreadProcessId(GetForegroundWindow(),&foreground);
         bool pressed=(GetAsyncKeyState(VK_F2)&0x8000)!=0;
         bool focused=foreground==GetCurrentProcessId();
         bool trigger=stereoKey.Press(focused,pressed);
-        if(!focused) {StopStereo("focus");return false;}
+        if(!stereo_trial::RenderAllowed(focused)) {StopStereo("focus");return false;}
         if(trigger && stereoActive){StopStereo("toggle");return false;}
         if(trigger && !stereoActive && captureQueue && !stereoRing.retained) {
             HRESULT hr=stereoOverlay.Start(true);
@@ -258,46 +394,152 @@ class SwapchainWrapper final : public IDXGISwapChain4 {
             if(FAILED(hr))stereoOverlay.Stop();
 #endif
             if(FAILED(hr)) {stereoOverlay.Stop();Log("stereo_start_error hr=%08lx",hr);return false;}
-            stereoActive=true;stereoFrame=0;stereoEyes[0]=stereoEyes[1]=0;stereoPairLeft=false;
-            cameraRecovery={};
+            stereoActive=true;stereoFrame=0;stereoEyes[0]=stereoEyes[1]=0;
+            cameraRecovery={};captureCycleGuard={};
+#ifdef FH4VR_SOURCE_DRIVEN_STEREO
+            render_source::tracker.Reset();lastSourceCommand=sourceUnknown=sourceRejected=0;
+            Log("source_driven_stereo enabled=1 native_setup_clock=1 exact_source_pose=1");
+#endif
+#ifdef FH4VR_GUARD_TIMING_TRACE
+            guardTrace.reset(new(std::nothrow) guard_timing::Recorder<>);
+            Log("guard_trace_ready allocated=%d",guardTrace!=nullptr);
+#endif
             stereo_trial::command.store(0);stereo_trial::deadline.store(0);
+#ifdef FH4VR_RENDER_CYCLE_LATCH
+            render_cycle::state.Stop();
+            Log("render_cycle_latch enabled=1 caller_rva=030c762d hold_frames=%llu",stereo_trial::holdFrames);
+#endif
             stereo_trial::applied.store(0);stereo_trial::rejected.store(0);
 #ifdef FH4VR_STEREO_HEAD
             stereo_head::applied.store(0);stereo_head::rejected.store(0);
 #endif
             Log("stereo_start toggle=1 duration_ms=unlimited hold_frames=%llu paired_submit=1",stereo_trial::holdFrames);
+            Log("stereo_copy_layout pair_slots=3 independent_eye_allocators=1 generation_guard=1 capture_lag=%llu",stereo_trial::captureLag);
             // Leave this activation frame centered. Publish command 1 after Present.
         }
         if(!stereoActive) return false;
+#ifdef FH4VR_FRAME_ORDER_TRACE
+        const bool traceDown=(GetAsyncKeyState(VK_F3)&0x8000)!=0;
+        if(focused && traceDown && !frameTraceKeyHeld){
+            const bool started=frame_order_trace::recorder.Start(GetTickCount64());
+#if defined(FH4VR_RENDER_MATRIX_PROBE) && !defined(FH4VR_SOURCE_DRIVEN_STEREO)
+            if(started)render_source::tracker.Reset();
+#endif
+            Log("frame_order_start accepted=%d duration_ms=2000 flush_on_vr_stop=1",started);
+        }
+        frameTraceKeyHeld=!focused || traceDown;
+        frame_order_trace::recorder.Poll(GetTickCount64());
+#endif
         uint64_t headRejected=0;
 #ifdef FH4VR_STEREO_HEAD
         headRejected=stereo_head::rejected.load();
 #endif
+#ifdef FH4VR_SOURCE_DRIVEN_STEREO
+        const auto sourceStamp=render_source::tracker.Read(GetCurrentThreadId());
+        const auto errors=stereo_trial::rejected.load()+headRejected;
+        const bool changedErrors=errors!=sourceRejected;sourceRejected=errors;
+        if(changedErrors || sourceStamp.status!=render_source::Matched || !sourceStamp.source.poseGeneration){
+#ifdef FH4VR_GUARD_TIMING_TRACE
+            if(guardTrace)guardTrace->Record(1,0,stereoFrame,0,sourceStamp.source.command);
+#endif
+            if(sourceStamp.source.command>lastSourceCommand)lastSourceCommand=sourceStamp.source.command;
+            stereoRing.DiscardPair();++sourceUnknown;return true;
+        }
+        if(sourceStamp.source.command<=lastSourceCommand)return true;
+        lastSourceCommand=sourceStamp.source.command;
+        const int eye=int((lastSourceCommand-1)%2);
+#ifdef FH4VR_GUARD_TIMING_TRACE
+        if(guardTrace)guardTrace->Record(1,1,stereoFrame,(lastSourceCommand+1)/2,lastSourceCommand);
+#endif
+#else
         const auto now=GetTickCount64();
         if(cameraRecovery.Observe(stereoFrame,stereo_trial::rejected.load(),headRejected,now,stereo_trial::holdFrames*2)){
-            stereoPairLeft=false;
+            stereoRing.DiscardPair();
             Log("stereo_drop_camera_pair frame=%llu through=%llu camera_rejected=%llu head_rejected=%llu",stereoFrame,cameraRecovery.dropThrough,cameraRecovery.camera,cameraRecovery.head);
         }
         if(cameraRecovery.Expired(now)){StopStereo("camera_recovery_timeout");return false;}
-        if(cameraRecovery.Drop(stereoFrame))return true; // Advance schedule without capturing either eye from this pair.
+        if(cameraRecovery.Drop(stereoFrame) || cameraRecovery.Drop(stereo_trial::ImageCommand(stereoFrame)))return true; // Advance schedule without capturing either eye from this pair.
         int eye=stereo_trial::CapturedEye(stereoFrame);
+#endif
         if(eye>=0) {
+#ifdef FH4VR_SOURCE_DRIVEN_STEREO
+            const uint64_t generation=(lastSourceCommand+1)/2;
+#else
+            const uint64_t generation=stereo_trial::CaptureGeneration(stereoFrame);
+#endif
+#if defined(FH4VR_RENDER_CYCLE_LATCH)
+            const auto captureCycle=render_cycle::state.Read();
+            // Schedule label and latest latch only: neither proves source pixel provenance.
+            frame_order_trace::Record(frame_order_trace::CaptureSource,stereo_trial::ImageCommand(stereoFrame),
+                nullptr,nullptr,captureCycle.command,generation);
+#ifdef FH4VR_RENDER_MATRIX_PROBE
+            if(frame_order_trace::recorder.Active()){
+                const auto tracedSource=render_source::tracker.Read(GetCurrentThreadId());
+                frame_order_trace::Record(frame_order_trace::RenderSourceAtCapture,tracedSource.source.command,
+                    nullptr,reinterpret_cast<void*>(tracedSource.target),tracedSource.source.serial,tracedSource.status);
+                frame_order_trace::Record(frame_order_trace::RenderSourcePose,tracedSource.source.command,
+                    nullptr,nullptr,tracedSource.source.pose.tick,render_source::tracker.Overflows());
+            }
+#endif
+#endif
+#if defined(FH4VR_CAPTURE_CYCLE_GUARD) && !defined(FH4VR_SOURCE_DRIVEN_STEREO)
+            static_assert(stereo_trial::holdFrames==1 && stereo_trial::captureLag==1,"Guard requires hold1/lag1");
+            const bool epochChanged=captureCycle.discontinuities!=captureCycleGuard.lastDiscontinuities;
+            const bool guardAccepted=captureCycleGuard.Accept(stereoFrame,captureCycle.command,generation,captureCycle.discontinuities,captureCycle.invalidThroughCommand);
+#ifdef FH4VR_GUARD_TIMING_TRACE
+            if(guardTrace)guardTrace->Record(1,(guardAccepted?1u:0u)|(captureCycle.command!=stereoFrame?2u:0u)|
+                (epochChanged?4u:0u)|(captureCycleGuard.blockedGeneration==generation?8u:0u)|
+                (generation<=captureCycleGuard.recoveryThrough?16u:0u),stereoFrame,generation,captureCycle.command,captureCycle.discontinuities,captureCycle.invalidThroughCommand);
+#else
+            (void)epochChanged;
+#endif
+            if(!guardAccepted){
+                stereoRing.DiscardPair();
+                if(captureCycleGuard.dropped<=8 || captureCycleGuard.dropped%60==0)
+                    Log("capture_cycle_guard_drop frame=%llu generation=%llu anomalies=%llu dropped=%llu",
+                        stereoFrame,generation,captureCycleGuard.anomalies,captureCycleGuard.dropped);
+                return true; // Advance the schedule, retain the last submitted complete pair.
+            }
+#endif
             capture::ComPtr<ID3D12Resource> source;
-            HRESULT hr=real->GetBuffer(real->GetCurrentBackBufferIndex(),IID_PPV_ARGS(&source));
-            if(SUCCEEDED(hr)) hr=stereoRing.Copy(captureQueue.Get(),source.Get(),eye);
+            HRESULT hr=vr_timing::Measure(vr_timing::Stage::GetBuffer,[&]{return real->GetBuffer(real->GetCurrentBackBufferIndex(),IID_PPV_ARGS(&source));});
+            if(SUCCEEDED(hr)) hr=vr_timing::Measure(vr_timing::Stage::CopyEnqueue,[&]{return stereoRing.Copy(captureQueue.Get(),source.Get(),eye,generation);});
+#ifdef FH4VR_GUARD_TIMING_TRACE
+            if(hr!=S_OK && guardTrace)guardTrace->Record(2,static_cast<unsigned>(hr),stereoFrame,generation);
+#endif
             if(hr==S_OK) {
                 ++stereoEyes[eye];
-                if(eye==0) stereoPairLeft=true;
-                if(eye==1 && stereoPairLeft && stereoRing.StereoReady()) {
+                if(eye==1 && stereoRing.StereoReady(generation)) {
+                    #ifdef FH4VR_LIVE_SCENE
+                    HRESULT submit=stereoOverlay.Submit(stereoRing.Latest(),captureQueue.Get(),generation
+#ifdef FH4VR_SOURCE_DRIVEN_STEREO
+                        ,&sourceStamp.source
+#endif
+                    );
+#else
                     HRESULT submit=stereoOverlay.Submit(stereoRing.Latest(),captureQueue.Get());
+#endif
+#ifdef FH4VR_GUARD_TIMING_TRACE
+                    if(guardTrace)guardTrace->Record(3,static_cast<unsigned>(submit),stereoFrame,generation);
+#endif
                     if(submit==S_OK)cameraRecovery.Submitted();
-                    HRESULT seal=stereoRing.SealLatest();hr=FAILED(submit)?submit:seal;
-                    stereoPairLeft=false;
+#ifdef FH4VR_SCENE_IMPLICIT_HANDOFF
+                    // After native Present, BeginPair waits for poses and hands
+                    // off the runtime's work. Seal only after that queue work.
+                    if(submit==S_OK){sceneSubmissionFence.Submitted();hr=S_OK;}
+                    else {
+                        stereoOverlay.Handoff();
+                        HRESULT seal=vr_timing::Measure(vr_timing::Stage::Seal,[&]{return stereoRing.SealLatest();});hr=FAILED(submit)?submit:seal;
+                    }
+#else
+                    HRESULT seal=vr_timing::Measure(vr_timing::Stage::Seal,[&]{return stereoRing.SealLatest();});hr=FAILED(submit)?submit:seal;
+#endif
                 }
             }
             if(FAILED(hr)) {Log("stereo_copy_error hr=%08lx",hr);StopStereo("copy_error");return false;}
         }
         return true;
+#endif
     }
     void AfterStereo(bool participating,HRESULT hr) {
         if(!participating || !stereoActive) return;
@@ -308,6 +550,9 @@ class SwapchainWrapper final : public IDXGISwapChain4 {
 #ifdef FH4VR_LIVE_SCENE
             HeadPose gamePose{};
             if(FAILED(stereoOverlay.BeginPair(gamePose))){StopStereo("pose_error");return;}
+#ifdef FH4VR_SCENE_IMPLICIT_HANDOFF
+            if(FAILED(SealSceneSubmission(stereoOverlay.PairWaited()))){StopStereo("scene_seal_error");return;}
+#endif
             AcquireSRWLockExclusive(&stereo_head::lock);
             stereo_head::pairPose=gamePose;
             ReleaseSRWLockExclusive(&stereo_head::lock);
@@ -316,8 +561,27 @@ class SwapchainWrapper final : public IDXGISwapChain4 {
 #endif
         }
 #endif
+#ifdef FH4VR_RENDER_CYCLE_LATCH
+        HeadPose cyclePose{};
+        AcquireSRWLockShared(&stereo_head::lock);cyclePose=stereo_head::pairPose;ReleaseSRWLockShared(&stereo_head::lock);
+        render_cycle::state.Publish(stereoFrame,cyclePose,ui_smoothing::Read()
+#ifdef FH4VR_SOURCE_DRIVEN_STEREO
+            ,&stereoOverlay.CurrentPose().absolute.m[0][0],stereoOverlay.CurrentPose().generation
+#endif
+        );
+#endif
+#ifdef FH4VR_SCENE_IMPLICIT_HANDOFF
+        // Delayed right-eye capture may submit between pose-sampling boundaries.
+        // Publish the next eye BEFORE handoff can block: game workers continue
+        // rendering during handoff. Pose/UI for this pair are already latched.
+        // Sealing still completes before the next Copy can reuse the slot.
+        if(FAILED(stereo_trial::PublishThenFinish(stereoFrame,[&]{return SealSceneSubmission(false);}))) {
+            StopStereo("scene_seal_error");return;
+        }
+#else
         stereo_trial::command.store(stereoFrame);
-        if(stereoFrame%300==0) Log("stereo_progress frames=%llu left=%llu right=%llu submitted=%u",stereoFrame,stereoEyes[0],stereoEyes[1],stereoOverlay.submitted);
+#endif
+        if(stereoFrame%300==0) Log("stereo_progress frames=%llu left=%llu right=%llu submitted=%u skipped=%llu dropped_pairs=%llu generation_rejected=%llu",stereoFrame,stereoEyes[0],stereoEyes[1],stereoOverlay.submitted,stereoRing.skipped,stereoRing.droppedPairs,stereoRing.wrongGeneration);
     }
 #endif
     struct CallScope {
@@ -340,6 +604,9 @@ public:
     ~SwapchainWrapper() {
 #ifdef FH4VR_STEREO_TRIAL
         StopStereo("destroy");
+#endif
+#ifdef FH4VR_FRAME_PHASE
+        StopPhase("destroy");
 #endif
 #ifdef FH4VR_AER_PROBE
         StopAer("destroy");
@@ -370,12 +637,21 @@ public:
     HRESULT STDMETHODCALLTYPE Present(UINT sync,UINT flags) override {
         CallScope call(this);
         if(!call.accepted) { Log("wrapper_present_reentry wrapper=%p",this);return DXGI_ERROR_INVALID_CALL; }
+#ifdef FH4VR_TIMING_PROBE
+        vr_timing::Frame timing(timingWindow,[](const char* line){Log("%s",line);});
+#endif
         auto n=++presents;
 #ifdef FH4VR_UI_LAYER_CAPTURE
         if(!(flags&DXGI_PRESENT_TEST)){DWORD pid=0;GetWindowThreadProcessId(GetForegroundWindow(),&pid);ui_layer_capture::Poll(pid==GetCurrentProcessId());}
 #endif
 #ifdef FH4VR_STEREO_TRIAL
         DWORD stereoSavedError=GetLastError();bool stereoParticipating=BeforeStereo(flags);SetLastError(stereoSavedError);
+#ifdef FH4VR_TIMING_PROBE
+        timing.Active(stereoParticipating);
+#endif
+#endif
+#ifdef FH4VR_FRAME_PHASE
+        DWORD phaseSavedError=GetLastError();unsigned capturedPhase=CapturePhase(flags);SetLastError(phaseSavedError);
 #endif
 #ifdef FH4VR_AER_PROBE
         unsigned aerPhase=CaptureAer(flags);
@@ -387,9 +663,18 @@ public:
 #endif
 #endif
         if(n==1 || n%600==0) Describe(real,"wrapper_present_before");
-        HRESULT hr=real->Present(sync,flags);DWORD saved=GetLastError();
+        #ifdef FH4VR_FRAME_ORDER_TRACE
+        frame_order_trace::Record(frame_order_trace::PresentEnter,stereo_trial::command.load(),nullptr,this);
+#endif
+        HRESULT hr=vr_timing::Measure(vr_timing::Stage::NativePresent,[&]{return real->Present(sync,flags);});DWORD saved=GetLastError();
+#ifdef FH4VR_FRAME_ORDER_TRACE
+        frame_order_trace::Record(frame_order_trace::PresentExit,stereo_trial::command.load(),nullptr,this);
+#endif
 #ifdef FH4VR_STEREO_TRIAL
         AfterStereo(stereoParticipating,hr);
+#endif
+#ifdef FH4VR_FRAME_PHASE
+        AdvancePhase(capturedPhase,hr);
 #endif
 #ifdef FH4VR_AER_PROBE
         AdvanceAer(aerPhase,hr);
@@ -404,6 +689,9 @@ public:
     HRESULT STDMETHODCALLTYPE ResizeBuffers(UINT a,UINT b,UINT c,DXGI_FORMAT d,UINT e) override {
 #ifdef FH4VR_GPU_COPY
         StopGpu("resize");
+#endif
+#ifdef FH4VR_FRAME_PHASE
+        StopPhase("resize");
 #endif
 #ifdef FH4VR_AER_PROBE
         StopAer("resize");
@@ -425,12 +713,21 @@ public:
     HRESULT STDMETHODCALLTYPE Present1(UINT sync,UINT flags,const DXGI_PRESENT_PARAMETERS* params) override {
         CallScope call(this);
         if(!call.accepted) { Log("wrapper_present1_reentry wrapper=%p",this);return DXGI_ERROR_INVALID_CALL; }
+#ifdef FH4VR_TIMING_PROBE
+        vr_timing::Frame timing(timingWindow,[](const char* line){Log("%s",line);});
+#endif
         auto n=++presents;
 #ifdef FH4VR_UI_LAYER_CAPTURE
         if(!(flags&DXGI_PRESENT_TEST)){DWORD pid=0;GetWindowThreadProcessId(GetForegroundWindow(),&pid);ui_layer_capture::Poll(pid==GetCurrentProcessId());}
 #endif
 #ifdef FH4VR_STEREO_TRIAL
         DWORD stereoSavedError=GetLastError();bool stereoParticipating=BeforeStereo(flags);SetLastError(stereoSavedError);
+#ifdef FH4VR_TIMING_PROBE
+        timing.Active(stereoParticipating);
+#endif
+#endif
+#ifdef FH4VR_FRAME_PHASE
+        DWORD phaseSavedError=GetLastError();unsigned capturedPhase=CapturePhase(flags);SetLastError(phaseSavedError);
 #endif
 #ifdef FH4VR_AER_PROBE
         unsigned aerPhase=CaptureAer(flags);
@@ -442,9 +739,18 @@ public:
 #endif
 #endif
         if(n==1 || n%600==0) Describe(real,"wrapper_present1_before");
-        HRESULT hr=real->Present1(sync,flags,params);DWORD saved=GetLastError();
+        #ifdef FH4VR_FRAME_ORDER_TRACE
+        frame_order_trace::Record(frame_order_trace::PresentEnter,stereo_trial::command.load(),nullptr,this);
+#endif
+        HRESULT hr=vr_timing::Measure(vr_timing::Stage::NativePresent,[&]{return real->Present1(sync,flags,params);});DWORD saved=GetLastError();
+#ifdef FH4VR_FRAME_ORDER_TRACE
+        frame_order_trace::Record(frame_order_trace::PresentExit,stereo_trial::command.load(),nullptr,this);
+#endif
 #ifdef FH4VR_STEREO_TRIAL
         AfterStereo(stereoParticipating,hr);
+#endif
+#ifdef FH4VR_FRAME_PHASE
+        AdvancePhase(capturedPhase,hr);
 #endif
 #ifdef FH4VR_AER_PROBE
         AdvanceAer(aerPhase,hr);
@@ -471,6 +777,9 @@ public:
     HRESULT STDMETHODCALLTYPE ResizeBuffers1(UINT a,UINT b,UINT c,DXGI_FORMAT d,UINT e,const UINT* f,IUnknown* const* g) override {
 #ifdef FH4VR_GPU_COPY
         StopGpu("resize");
+#endif
+#ifdef FH4VR_FRAME_PHASE
+        StopPhase("resize");
 #endif
 #ifdef FH4VR_AER_PROBE
         StopAer("resize");

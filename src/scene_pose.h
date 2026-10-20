@@ -36,3 +36,25 @@ struct ScenePoseState {
         valid=false;return true;
     }
 };
+
+// Resolve pixels by their originating camera generation, never the newest pose.
+inline ScenePoseState* SelectScenePose(ScenePoseState& current,ScenePoseState& previous,uint64_t generation) {
+    if(!generation || generation==current.generation)return &current;
+    if(generation==previous.generation)return &previous;
+    return nullptr;
+}
+
+// Preserve the originating game and absolute pose together, even after newer
+// runtime samples have arrived. This creates a local submission copy.
+inline bool CopySourceScenePose(const HeadPose& game,const float* absolute,uint64_t sourceGeneration,
+                                uint64_t imageGeneration,ULONGLONG now,ScenePoseState& result){
+    result={};
+    if(!absolute || !sourceGeneration || !imageGeneration || !PoseUsable(game,now))return false;
+    float rotation[9]{};
+    for(unsigned i=0;i<12;++i)if(!std::isfinite(absolute[i]))return false;
+    for(unsigned i=0;i<3;++i)for(unsigned j=0;j<3;++j)rotation[i*3+j]=absolute[i*4+j];
+    if(!RotationValid(rotation))return false;
+    memcpy(&result.absolute,absolute,sizeof(result.absolute));
+    result.game=game;result.generation=imageGeneration;result.valid=true;
+    return true;
+}

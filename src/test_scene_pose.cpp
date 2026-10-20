@@ -8,6 +8,17 @@ static vr::TrackedDevicePose_t Pose(float yaw) {
     m[0][3]=.2f;m[1][3]=1.6f;m[2][3]=-.3f;return p;
 }
 int main(){
+    // New camera generation must not relabel the previous pair's pixels.
+    ScenePoseState current{},previous{};
+    if(!current.Begin(Pose(.1f),false,100))return 60;
+    previous=current;
+    if(!current.Begin(Pose(.7f),false,110))return 61;
+    auto old=SelectScenePose(current,previous,1);
+    if(old!=&previous || std::abs(old->absolute.m[0][2]-std::sin(.1f))>.00001f)return 62;
+    old->valid=false;
+    if(!current.valid || SelectScenePose(current,previous,2)!=&current || SelectScenePose(current,previous,3))return 63;
+    if(!old->DropIfStale(120))return 64;
+    if(!current.Begin(Pose(.9f),true,130) || previous.valid)return 65;
     ScenePoseState s{};auto first=Pose(.3f);
     if(s.Usable(100) || !s.Begin(first,false,100) || !s.Usable(100))return 1;
     const float identity[9]={1,0,0,0,1,0,0,0,1};
@@ -50,5 +61,12 @@ int main(){
     if(!upright.Begin(tilted,false,520))return 18;
     for(int i=0;i<9;++i)if(std::abs(upright.game.rotation[i]-identity[i])>.00001f)return 19;
     if(memcmp(&upright.absolute,&tilted.mDeviceToAbsoluteTracking,sizeof(upright.absolute)))return 20;
-    puts("PASS scene paired pose, yaw-only recenter, pitch/roll tracking retained, upright restoration, age and invalid rejection");
+    ScenePoseState retained{};
+    if(!CopySourceScenePose(upright.game,&upright.absolute.m[0][0],upright.generation,123,530,retained))return 22;
+    if(retained.generation!=123 || memcmp(&retained.absolute,&upright.absolute,sizeof(retained.absolute)) ||
+       memcmp(&retained.game,&upright.game,sizeof(retained.game)))return 23;
+    if(CopySourceScenePose(upright.game,&upright.absolute.m[0][0],0,123,530,retained))return 24;
+    if(CopySourceScenePose(upright.game,&upright.absolute.m[0][0],1,123,1000,retained))return 25;
+    float invalid[12]{};if(CopySourceScenePose(upright.game,invalid,1,123,530,retained))return 26;
+    puts("PASS scene paired pose, yaw-only recenter, source absolute/relative retention, age and invalid rejection");
 }

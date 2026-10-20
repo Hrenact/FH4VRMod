@@ -316,6 +316,9 @@ static void Log(DWORD status) {
 #include "menu_camera_probe.h"
 #include "presentation_camera_probe.h"
 #include "multicam_probe.h"
+#ifdef FH4VR_RENDER_MATRIX_PROBE
+#include "render_matrix_probe.h"
+#endif
 #endif
 extern "C" void SetProbeModule(HMODULE module) { self=module; }
 extern "C" DWORD WINAPI StartProbe(void*) {
@@ -465,6 +468,9 @@ extern "C" DWORD WINAPI StartProbe(void*) {
     }
 #endif
     if(status==ERROR_SUCCESS)Log(multicam_probe::Start(base,self,ReplaceSlot));
+#ifdef FH4VR_RENDER_MATRIX_PROBE
+    if(status==ERROR_SUCCESS)ui_projection_probe::Record("render_matrix_probe_enabled",render_matrix_probe::Start(base,ReplaceSlot),nullptr,nullptr);
+#endif
 #endif
     return status;
 }
@@ -486,6 +492,9 @@ extern "C" DWORD WINAPI StopProbe(void*) {
     menu_camera_probe::Stop(ReplaceSlot);
     presentation_camera_probe::Stop(ReplaceSlot);
     multicam_probe::Stop(ReplaceSlot);
+#ifdef FH4VR_RENDER_MATRIX_PROBE
+    render_matrix_probe::Stop(ReplaceSlot);
+#endif
     ui_projection_probe::StopClipHooks(ReplaceSlot);
     if(ui_pass_probe::slot)ReplaceSlot(ui_pass_probe::slot,reinterpret_cast<void*>(&ui_pass_probe::Observe),reinterpret_cast<void*>(ui_pass_probe::original));
     if(ui_pass_probe::endSlot)ReplaceSlot(ui_pass_probe::endSlot,reinterpret_cast<void*>(&ui_pass_probe::ObserveEnd),reinterpret_cast<void*>(ui_pass_probe::originalEnd));
